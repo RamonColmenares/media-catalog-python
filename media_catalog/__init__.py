@@ -1,3 +1,3 @@
-"""Movie, series, and catalog HTTP services."""
+"""Local content catalog operations services."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

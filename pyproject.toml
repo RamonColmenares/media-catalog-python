@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "media-catalog-python"
-version = "1.0.0"
+version = "2.0.0"
 description = "Python services for movie, series, and catalog data with an HTTP gateway."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10"]
+dev = ["httpx2>=2.13,<3", "pytest>=8,<10"]
 rabbitmq = ["pika>=1.3,<2"]
 
 [project.scripts]

@@ -1,4 +1,4 @@
-"""HTTP gateway for the movie, series, and catalog services."""
+"""HTTP gateway that forwards domain paths and reports upstream readiness."""
 
 from __future__ import annotations
 
@@ -9,28 +9,13 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Request
-from starlette.responses import PlainTextResponse, Response
-
+from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger("media_catalog.gateway")
-_SERVICE_NAMES = {"movies": "movie", "series": "series", "catalogs": "catalogs"}
-_FALLBACKS = {
-    "movies": "Servidor de movies no está disponible actualmente",
-    "series": "Servidor de series no está disponible actualmente",
-    "catalogs": "Servidor de catalogos no está disponible actualmente",
-}
-_HOP_BY_HOP_HEADERS = {
-    b"connection",
-    b"content-encoding",
-    b"content-length",
-    b"host",
-    b"keep-alive",
-    b"proxy-authenticate",
-    b"proxy-authorization",
-    b"te",
-    b"trailer",
-    b"transfer-encoding",
-    b"upgrade",
+_SERVICES = {"movies": "movie", "series": "series", "catalogs": "catalog"}
+_HOP_BY_HOP = {
+    b"connection", b"content-length", b"host", b"keep-alive",
+    b"proxy-authenticate", b"proxy-authorization", b"te", b"trailer", b"transfer-encoding", b"upgrade",
 }
 
 
@@ -40,61 +25,56 @@ def create_app() -> FastAPI:
         "series": os.getenv("SERIES_SERVICE_URL", "http://127.0.0.1:8103").rstrip("/"),
         "catalogs": os.getenv("CATALOG_SERVICE_URL", "http://127.0.0.1:8104").rstrip("/"),
     }
-    request_timeout = float(os.getenv("GATEWAY_REQUEST_TIMEOUT", "1.5"))
+    request_timeout = float(os.getenv("GATEWAY_REQUEST_TIMEOUT", "2"))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        async with httpx.AsyncClient(timeout=request_timeout) as client:
+        async with httpx.AsyncClient(timeout=request_timeout, follow_redirects=False) as client:
             app.state.http_client = client
             yield
 
-    app = FastAPI(title="Media API gateway", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Media API gateway", version="2.0.0", lifespan=lifespan)
 
-    @app.get("/fallback/movies")
-    async def movie_fallback() -> PlainTextResponse:
-        return PlainTextResponse(_FALLBACKS["movies"], status_code=500)
+    @app.get("/health/live")
+    async def live() -> dict[str, bool]:
+        return {"live": True}
 
-    @app.get("/fallback/series")
-    async def series_fallback() -> PlainTextResponse:
-        return PlainTextResponse(_FALLBACKS["series"], status_code=500)
-
-    @app.get("/fallback/catalogs")
-    async def catalog_fallback() -> PlainTextResponse:
-        return PlainTextResponse(_FALLBACKS["catalogs"], status_code=500)
+    @app.get("/health/ready")
+    async def ready() -> Response:
+        states = {}
+        for prefix, url in service_urls.items():
+            name = _SERVICES[prefix]
+            health_path = "/catalogs/health" if name == "catalog" else f"/{prefix}/health"
+            try:
+                response = await app.state.http_client.get(f"{url}{health_path}")
+                states[name] = {"reachable": response.status_code == 200, "statusCode": response.status_code}
+            except httpx.HTTPError:
+                states[name] = {"reachable": False, "statusCode": None}
+        is_ready = all(state["reachable"] for state in states.values())
+        return JSONResponse(status_code=200 if is_ready else 503, content={"ready": is_ready, "upstreams": states})
 
     async def forward(service: str, subpath: str, request: Request) -> Response:
         if service not in service_urls:
-            return PlainTextResponse("Not Found", status_code=404)
-        logger.info("Forwarding request path=%s", request.url.path)
-        url_path = f"/{service}"
-        if subpath:
-            url_path += f"/{subpath}"
-        headers = {
-            key.decode("latin-1"): value.decode("latin-1")
-            for key, value in request.headers.raw
-            if key.lower() not in _HOP_BY_HOP_HEADERS
-        }
+            return JSONResponse(status_code=404, content={"error": {"code": "unknown_service", "message": "No service handles this route", "details": {"service": service}}})
+        route = f"/{service}" + (f"/{subpath}" if subpath else "")
+        headers = [(key.decode("latin-1"), value.decode("latin-1")) for key, value in request.headers.raw if key.lower() not in _HOP_BY_HOP]
         try:
             upstream = await app.state.http_client.request(
                 request.method,
-                f"{service_urls[service]}{url_path}",
+                f"{service_urls[service]}{route}",
                 params=list(request.query_params.multi_items()),
                 headers=headers,
                 content=await request.body(),
             )
-        except httpx.HTTPError:
-            return PlainTextResponse(_FALLBACKS[service], status_code=500)
-
-        response_headers = {
-            key: value
-            for key, value in upstream.headers.items()
-            if key.lower().encode("latin-1") not in _HOP_BY_HOP_HEADERS
-        }
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=response_headers,
-        )
+        except httpx.HTTPError as error:
+            logger.info("Upstream request failed service=%s path=%s type=%s", service, request.url.path, error.__class__.__name__)
+            return JSONResponse(status_code=503, content={"error": {"code": "upstream_unavailable", "message": f"The {service} service is unavailable", "details": {"service": service}}})
+        forwarded = Response(content=upstream.content, status_code=upstream.status_code)
+        kept = [(key, value) for key, value in upstream.headers.raw if key.lower() not in _HOP_BY_HOP]
+        retained_names = {key.lower() for key, _ in kept}
+        generated = [(key, value) for key, value in forwarded.raw_headers if key.lower() not in retained_names]
+        forwarded.raw_headers = [(key, value) for key, value in kept if key.lower() != b"content-encoding"] + generated
+        return forwarded
 
     methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 

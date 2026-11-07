@@ -68,7 +68,7 @@ class LiveStack:
         self._wait_ready(name)
 
     def _wait_ready(self, name: str) -> None:
-        paths = {"movie": "/movies", "series": "/series", "catalog": "/catalogs/movies/Probe", "gateway": "/movies"}
+        paths = {"movie": "/movies/health", "series": "/series/health", "catalog": "/catalogs/ready", "gateway": "/health/ready"}
         url = f"http://127.0.0.1:{self.ports[name]}{paths[name]}"
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:

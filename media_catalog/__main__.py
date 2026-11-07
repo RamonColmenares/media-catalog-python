@@ -8,6 +8,8 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 from pathlib import Path
 
 
@@ -59,11 +61,46 @@ def _local(host: str, data_dir: str) -> int:
                 )
             )
         print("Local services are starting; use Ctrl-C to stop the stack.", flush=True)
-        while not stopping:
-            for child in children:
+        readiness_paths = {
+            "movie": "/movies/health",
+            "series": "/series/health",
+            "catalog": "/catalogs/ready",
+            "gateway": "/health/ready",
+        }
+        ready_services: set[str] = set()
+        startup_deadline = time.monotonic() + 30
+        while not stopping and len(ready_services) < len(SERVICES):
+            for name, (_, port_env, default_port) in SERVICES.items():
+                child = children[list(SERVICES).index(name)]
                 code = child.poll()
                 if code is not None:
-                    return code or 0
+                    print(f"{name} service exited during startup with code {code}.", file=sys.stderr, flush=True)
+                    return code or 1
+                if name in ready_services:
+                    continue
+                port = int(env.get(port_env, default_port))
+                try:
+                    with urlopen(f"http://127.0.0.1:{port}{readiness_paths[name]}", timeout=0.4) as response:
+                        if response.status == 200:
+                            ready_services.add(name)
+                except HTTPError:
+                    pass
+                except (URLError, TimeoutError, OSError):
+                    pass
+            if time.monotonic() >= startup_deadline:
+                waiting = ", ".join(sorted(set(SERVICES) - ready_services))
+                print(f"Local services did not become ready within 30 seconds: {waiting}.", file=sys.stderr, flush=True)
+                return 1
+            time.sleep(0.15)
+        if stopping:
+            return 0
+        print("All local services are ready.", flush=True)
+        while not stopping:
+            for name, child in zip(SERVICES, children):
+                code = child.poll()
+                if code is not None:
+                    print(f"{name} service exited unexpectedly with code {code}.", file=sys.stderr, flush=True)
+                    return code or 1
             time.sleep(0.2)
         return 0
     finally:
@@ -97,6 +134,10 @@ def main() -> None:
     consumer.add_argument("--db")
     consumer.add_argument("--queue")
 
+    from media_catalog.operator_cli import add_operator_arguments
+
+    add_operator_arguments(commands)
+
     args = parser.parse_args()
     if args.command == "serve":
         default_port = int(os.getenv(SERVICES[args.service][1], SERVICES[args.service][2]))
@@ -107,6 +148,10 @@ def main() -> None:
         from media_catalog.broker import consume_movie_queue
 
         consume_movie_queue(database_path=args.db, queue_name=args.queue)
+    if args.command == "operator":
+        from media_catalog.operator_cli import run_operator
+
+        raise SystemExit(run_operator(args))
 
 
 if __name__ == "__main__":
